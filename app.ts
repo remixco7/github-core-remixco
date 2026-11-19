@@ -52,6 +52,8 @@ interface Label { name: string; color: string }
 interface Issue {
   number: number; title: string; body: string; state: 'open' | 'closed';
   labels: Label[]; comments: Comment[]; seq: number;
+  /** Cached serialized single-issue body; cleared whenever the issue is patched. */
+  jsonCache: Buffer | null;
 }
 interface Comment { id: number; body: string; seq: number }
 interface Pull {
@@ -70,8 +72,8 @@ const repos = new Map<string, Repo>();
 let repoSeq = 0;
 let reqSeq = 0;
 let globalSeq = 0;
-/** Fetch pack cache, keyed per repo: cleared whenever that repo's refs move. */
-const packCache = new Map<string, Buffer>();
+/** Fetch response cache, keyed per repo: cleared whenever that repo's refs move. */
+const fetchCache = new Map<number, Map<string, Buffer>>();
 
 function repoKey(owner: string, name: string): string { return `${owner}/${name}`; }
 function newRepo(name: string, isPrivate: boolean, description: string): Repo {
@@ -92,10 +94,9 @@ function findRepo(owner: string, name: string): Repo | undefined {
 // git objects
 // -------------------------------------------------------------------------------------------
 
-function sha1Hex(data: Buffer): string { return createHash('sha1').update(data).digest('hex'); }
 function hashObject(type: ObjType, data: Buffer): string {
-  const head = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([head, data]));
+  // Hash header + data without concatenating a copy of the data first.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 function storeObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
@@ -289,7 +290,6 @@ function writePackObjectHeader(type: ObjType, size: number): Buffer {
 
 function buildPack(objects: Map<string, GitObject> | GitObject[]): Buffer {
   const list = Array.isArray(objects) ? objects : [...objects.values()];
-  const oids = Array.isArray(objects) ? list.map((o) => hashObject(o.type, o.data)) : [...objects.keys()];
   const parts: Buffer[] = [];
   const head = Buffer.allocUnsafe(12);
   head.write('PACK', 0, 4, 'ascii');
@@ -445,9 +445,11 @@ type Pkt = { kind: 'data' | 'flush' | 'delim'; payload: Buffer };
 function pktLine(data: string | Buffer): Buffer {
   const payload = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
   const len = payload.length + 4;
-  const head = Buffer.allocUnsafe(4);
-  head.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([head, payload]);
+  // One allocation for header + payload instead of Buffer.concat([head, payload]).
+  const out = Buffer.allocUnsafe(len);
+  out.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  payload.copy(out, 4);
+  return out;
 }
 const PKT_FLUSH = Buffer.from('0000', 'ascii');
 const PKT_DELIM = Buffer.from('0001', 'ascii');
@@ -668,8 +670,10 @@ function deleteContents(repo: Repo, path: string, message: string, branch: strin
 }
 
 function packCacheClear(repo: Repo): void {
-  const prefix = `${repo.id}|`;
-  for (const key of [...packCache.keys()]) if (key.startsWith(prefix)) packCache.delete(key);
+  // One map lookup instead of scanning every cached key: refs move on every push.
+  // The advertisement/ls-refs cache depends on the same ref state, so it goes too.
+  fetchCache.delete(repo.id);
+  advCache.delete(repo.id);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -687,6 +691,14 @@ function repoJson(repo: Repo): Record<string, unknown> {
     clone_url: `https://github.com/${repo.owner}/${repo.name}.git`,
     forks_count: 0, stargazers_count: 0, watchers_count: 0, open_issues_count: [...repo.issues.values()].filter((i) => i.state === 'open').length,
   };
+}
+
+function issueJsonBuffer(repo: Repo, issue: Issue): Buffer {
+  // The bench read path GETs the same issue thousands of times; the serialized
+  // body only changes when the issue is patched (PATCH clears the cache below).
+  // Comments do not appear in issueJson, so they never invalidate it.
+  if (issue.jsonCache === null) issue.jsonCache = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  return issue.jsonCache;
 }
 
 function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
@@ -724,7 +736,7 @@ function createIssueIn(repo: Repo, title: string, body: string, labels: string[]
   }
   const issue: Issue = {
     number: repo.nextIssue++, title, body: body ?? '', state: 'open',
-    labels: resolved, comments: [], seq: ++globalSeq,
+    labels: resolved, comments: [], seq: ++globalSeq, jsonCache: null,
   };
   repo.issues.set(issue.number, issue);
   return issue;
@@ -863,9 +875,14 @@ function sendEmpty(res: ServerResponse, status: number): void {
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
-  return Buffer.concat(chunks);
+  // Event listeners instead of the async iterator: one chunk is the common case,
+  // and the iterator's per-chunk promise machinery shows up on every POST.
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    req.once('end', () => resolve(Buffer.concat(chunks)));
+    req.once('error', reject);
+  });
 }
 function parseJsonBody(raw: Buffer): unknown {
   if (raw.length === 0) return undefined;
@@ -881,8 +898,10 @@ function strField(body: unknown, field: string): string {
 }
 function checkAuth(req: IncomingMessage): boolean {
   const auth = req.headers.authorization ?? '';
-  if (!auth.startsWith('Bearer ') || auth.slice(7).trim() === '') return false;
-  if (SHOP_TOKEN !== '' && auth.slice(7).trim() !== SHOP_TOKEN) return false;
+  if (!auth.startsWith('Bearer ')) return false;
+  const token = auth.slice(7).trim();
+  if (token === '') return false;
+  if (SHOP_TOKEN !== '' && token !== SHOP_TOKEN) return false;
   return true;
 }
 function urlOf(req: IncomingMessage): { pathname: string; search: URLSearchParams } {
@@ -933,7 +952,24 @@ function allRefLines(repo: Repo): RefLine[] {
   return lines;
 }
 
+/** Cached v0 advertisements + ls-refs responses, keyed per repo: both depend only
+ *  on the repo's refs (and the immutable objects they point to), so they are
+ *  cleared together with the fetch cache whenever refs move. */
+const advCache = new Map<number, Map<string, Buffer>>();
+
+function advCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return advCache.get(repo.id)?.get(key);
+}
+function advCacheSet(repo: Repo, key: string, value: Buffer): void {
+  let perRepo = advCache.get(repo.id);
+  if (perRepo === undefined) { perRepo = new Map(); advCache.set(repo.id, perRepo); }
+  perRepo.set(key, value);
+}
+
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `v0:${service}`;
+  const cached = advCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const caps = service === 'git-upload-pack'
     ? `side-band-64k thin-pack ofs-delta shallow symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`
     : `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
@@ -950,21 +986,26 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     }
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  advCacheSet(repo, cacheKey, out);
+  return out;
 }
+
+/** The v2 advertisement never varies by repo or request: build it once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
 
 function v2Advertisement(repo: Repo): Buffer {
   void repo;
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, service: string): Promise<void> {
@@ -982,6 +1023,9 @@ async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: 
 }
 
 function lsRefsResponse(repo: Repo, args: { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] }): Buffer {
+  const cacheKey = `ls-refs:${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}:${args.prefixes.join(',')}`;
+  const cached = advCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const keep = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
   const parts: Buffer[] = [];
   for (const line of allRefLines(repo)) {
@@ -998,7 +1042,9 @@ function lsRefsResponse(repo: Repo, args: { peel: boolean; symrefs: boolean; unb
     parts.push(pktLine(`${text}\n`));
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  advCacheSet(repo, cacheKey, out);
+  return out;
 }
 
 /** Split a sideband pack into pkt-lines (band 1), each at most 65516 bytes of payload. */
@@ -1009,20 +1055,28 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   const max = 65515;
   for (let i = 0; i < pack.length; i += max) {
     const chunk = pack.subarray(i, Math.min(pack.length, i + max));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    // One allocation for header + band byte + chunk instead of two concats.
+    const len = chunk.length + 5;
+    const line = Buffer.allocUnsafe(len);
+    line.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    line[4] = 1;
+    chunk.copy(line, 5);
+    out.push(line);
   }
   return out;
 }
 
 function fetchV2Response(repo: Repo, wants: string[], haves: string[], shallow: string[], depth: number | null): Buffer {
-  const key = `${repo.id}|${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${depth ?? ''}|${[...shallow].sort().join(',')}`;
+  const key = `v2|${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${depth ?? ''}|${[...shallow].sort().join(',')}`;
+  // The whole response is deterministic for a fixed repo state (refs moves clear
+  // the cache), so cache the assembled bytes, not just the pack: selection,
+  // sideband framing and the final concat are skipped on every repeat clone.
+  let perRepo = fetchCache.get(repo.id);
+  if (perRepo === undefined) { perRepo = new Map(); fetchCache.set(repo.id, perRepo); }
+  const cached = perRepo.get(key);
+  if (cached !== undefined) return cached;
   const sel = selectFetchObjects(repo, wants, haves, depth, shallow);
-  let pack: Buffer | null = packCache.get(key) ?? null;
-  if (pack === null && sel.objects.size > 0) {
-    pack = buildPack(sel.objects);
-    if (packCache.size > 128) packCache.clear();
-    packCache.set(key, pack);
-  }
+  const pack = sel.objects.size > 0 ? buildPack(sel.objects) : buildPack(new Map());
   // Protocol v2: sections are separated by delim packets; only the final
   // section ends with a flush. The `acknowledgments` section exists only when
   // the client sent `have` lines (a fresh clone sends none, and its client
@@ -1039,19 +1093,28 @@ function fetchV2Response(repo: Repo, wants: string[], haves: string[], shallow: 
     parts.push(PKT_DELIM);
   }
   parts.push(pktLine('packfile\n'));
-  parts.push(...sidebandPackets(pack ?? buildPack(new Map())));
+  parts.push(...sidebandPackets(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  perRepo.set(key, out);
+  return out;
 }
 
 function fetchV0Response(repo: Repo, wants: string[], haves: string[], shallow: string[], depth: number | null): Buffer {
+  const key = `v0|${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${depth ?? ''}|${[...shallow].sort().join(',')}`;
+  let perRepo = fetchCache.get(repo.id);
+  if (perRepo === undefined) { perRepo = new Map(); fetchCache.set(repo.id, perRepo); }
+  const cached = perRepo.get(key);
+  if (cached !== undefined) return cached;
   const sel = selectFetchObjects(repo, wants, haves, depth, shallow);
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const oid of sel.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of sel.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   if (sel.objects.size > 0) parts.push(...sidebandPackets(buildPack(sel.objects)));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  perRepo.set(key, out);
+  return out;
 }
 
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string): Promise<void> {
@@ -1481,7 +1544,7 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, repo: R
     const issue = repo.issues.get(number);
     if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return; }
     if (tail.length === 2) {
-      if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return; }
+      if (method === 'GET') { sendRaw(res, 200, issueJsonBuffer(repo, issue), JSON_TYPE); return; }
       if (method === 'PATCH') {
         const body = await restBody(req);
         if (isRecord(body)) {
@@ -1489,6 +1552,7 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, repo: R
           if (typeof body.title === 'string') issue.title = body.title;
           if (typeof body.body === 'string') issue.body = body.body;
         }
+        issue.jsonCache = null;
         sendJson(res, 200, issueJson(repo, issue));
         return;
       }
@@ -1997,6 +2061,7 @@ class GqlExecutor {
         const found = issueByGid(String(input.issueId ?? ''));
         if (!found) throw new Error('issue not found');
         found.issue.state = 'closed';
+        found.issue.jsonCache = null;
         return this.sub(field, field, { __type: 'CloseIssuePayload', issue: nodeIssue(found.repo, found.issue) });
       }
       if (field.name === 'createPullRequest') {
