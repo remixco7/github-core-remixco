@@ -11,7 +11,7 @@
 // is a counter. Objects are stored byte-exactly as pushed and packs are built
 // from those bytes, so a clone recomputes every SHA-1.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer, type Server as TcpServer, type Socket } from 'node:net';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -847,10 +847,29 @@ function mergePull(repo: Repo, pull: Pull): string {
 }
 
 // -------------------------------------------------------------------------------------------
-// HTTP plumbing
+// HTTP plumbing (raw TCP transport)
 // -------------------------------------------------------------------------------------------
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+/**
+ * The only request surface the handlers use: method, raw URL, lower-cased headers,
+ * and the fully-read body. The transport reads the body before dispatching, so
+ * readBody is a plain accessor instead of a stream read.
+ */
+interface HttpReq {
+  method: string;
+  url: string;
+  headers: Record<string, string | undefined>;
+  body: Buffer;
+}
+/** The only response surface the handlers use. */
+interface HttpRes {
+  headersSent: boolean;
+  writeHead(status: number, headers: Record<string, string>): void;
+  end(body?: string | Buffer): void;
+  destroy(): void;
+}
+
+function sendJson(res: HttpRes, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
@@ -860,7 +879,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   });
   res.end(text);
 }
-function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
+function sendRaw(res: HttpRes, status: number, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': body.length,
@@ -869,20 +888,15 @@ function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType:
   });
   res.end(body);
 }
-function sendEmpty(res: ServerResponse, status: number): void {
+function sendEmpty(res: HttpRes, status: number): void {
   res.writeHead(status, { 'x-github-request-id': `req-${++reqSeq}` });
   res.end();
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  // Event listeners instead of the async iterator: one chunk is the common case,
-  // and the iterator's per-chunk promise machinery shows up on every POST.
-  return new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    req.once('end', () => resolve(Buffer.concat(chunks)));
-    req.once('error', reject);
-  });
+async function readBody(req: HttpReq): Promise<Buffer> {
+  // The transport has already read the whole body (it must, to find the next
+  // request on a keep-alive connection), so this is a plain accessor.
+  return req.body;
 }
 function parseJsonBody(raw: Buffer): unknown {
   if (raw.length === 0) return undefined;
@@ -896,7 +910,7 @@ function strField(body: unknown, field: string): string {
   if (isRecord(body) && typeof body[field] === 'string') return body[field] as string;
   return '';
 }
-function checkAuth(req: IncomingMessage): boolean {
+function checkAuth(req: HttpReq): boolean {
   const auth = req.headers.authorization ?? '';
   if (!auth.startsWith('Bearer ')) return false;
   const token = auth.slice(7).trim();
@@ -904,11 +918,15 @@ function checkAuth(req: IncomingMessage): boolean {
   if (SHOP_TOKEN !== '' && token !== SHOP_TOKEN) return false;
   return true;
 }
-function urlOf(req: IncomingMessage): { pathname: string; search: URLSearchParams } {
-  try {
-    const u = new URL(req.url ?? '/', 'http://entry');
-    return { pathname: u.pathname, search: u.searchParams };
-  } catch { return { pathname: '/', search: new URLSearchParams() }; }
+function urlOf(req: HttpReq): { pathname: string; search: URLSearchParams } {
+  // Manual split instead of `new URL`: the transport already guarantees an
+  // origin-form path, and the query is the only part that needs parsing.
+  // (URL would also normalize dot segments; no client sends those.)
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  const pathname = q === -1 ? raw : raw.slice(0, q);
+  const search = new URLSearchParams(q === -1 ? '' : raw.slice(q + 1));
+  return { pathname: pathname === '' ? '/' : pathname, search };
 }
 function pageParams(search: URLSearchParams): { page: number; perPage: number } {
   const page = Math.max(1, Number.parseInt(search.get('page') ?? '1', 10) || 1);
@@ -918,7 +936,7 @@ function pageParams(search: URLSearchParams): { page: number; perPage: number } 
 function paginate<T>(items: T[], page: number, perPage: number): T[] {
   return items.slice((page - 1) * perPage, page * perPage);
 }
-function linkHeader(req: IncomingMessage, basePath: string, search: URLSearchParams, page: number, perPage: number, total: number): string | null {
+function linkHeader(req: HttpReq, basePath: string, search: URLSearchParams, page: number, perPage: number, total: number): string | null {
   const lastPage = Math.max(1, Math.ceil(total / perPage));
   if (page >= lastPage) return null;
   const host = req.headers.host ?? 'entry';
@@ -1008,7 +1026,7 @@ function v2Advertisement(repo: Repo): Buffer {
   return V2_ADVERTISEMENT;
 }
 
-async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, service: string): Promise<void> {
+async function handleInfoRefs(req: HttpReq, res: HttpRes, owner: string, repoName: string, service: string): Promise<void> {
   const repo = findRepo(owner, repoName);
   if (!repo || (service !== 'git-upload-pack' && service !== 'git-receive-pack')) {
     sendJson(res, 404, { message: 'Not Found' });
@@ -1117,7 +1135,7 @@ function fetchV0Response(repo: Repo, wants: string[], haves: string[], shallow: 
   return out;
 }
 
-async function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string): Promise<void> {
+async function handleUploadPack(req: HttpReq, res: HttpRes, owner: string, repoName: string): Promise<void> {
   const repo = findRepo(owner, repoName);
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
   const body = await readBody(req);
@@ -1189,7 +1207,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner
   sendRaw(res, 200, fetchV0Response(repo, wants, haves, shallow, Number.isFinite(depth) ? depth : null), 'application/x-git-upload-pack-result');
 }
 
-async function handleReceivePack(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string): Promise<void> {
+async function handleReceivePack(req: HttpReq, res: HttpRes, owner: string, repoName: string): Promise<void> {
   const repo = findRepo(owner, repoName);
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
   const body = await readBody(req);
@@ -1278,11 +1296,11 @@ function errMessage(err: unknown): string {
 }
 
 /** Load and validate a JSON body for a REST write; throws 400 on malformed JSON. */
-async function restBody(req: IncomingMessage): Promise<unknown> {
+async function restBody(req: HttpReq): Promise<unknown> {
   return parseJsonBody(await readBody(req));
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRest(req: HttpReq, res: HttpRes): Promise<void> {
   const method = req.method ?? 'GET';
   const { pathname, search } = urlOf(req);
   if (!checkAuth(req)) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
@@ -1350,7 +1368,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<vo
   sendJson(res, 404, { message: 'Not Found' });
 }
 
-async function handleRepoRest(req: IncomingMessage, res: ServerResponse, repo: Repo, tail: string[], search: URLSearchParams, method: string): Promise<void> {
+async function handleRepoRest(req: HttpReq, res: HttpRes, repo: Repo, tail: string[], search: URLSearchParams, method: string): Promise<void> {
   // /repos/{o}/{r} itself
   if (tail.length === 0) {
     if (method === 'GET') { sendJson(res, 200, repoJson(repo)); return; }
@@ -2199,7 +2217,7 @@ class GqlExecutor {
   }
 }
 
-async function handleGraphql(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleGraphql(req: HttpReq, res: HttpRes): Promise<void> {
   if (!checkAuth(req)) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
   let body: unknown;
   try { body = parseJsonBody(await readBody(req)); }
@@ -2409,7 +2427,7 @@ function runMcpTool(name: string, args: Record<string, unknown>): Record<string,
   return toolErrorResult(`unknown tool: ${name}`);
 }
 
-async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleMcp(req: HttpReq, res: HttpRes): Promise<void> {
   if (req.method !== 'POST') { sendJson(res, 405, { message: 'Method Not Allowed' }); return; }
   const raw = await readBody(req);
   const text = raw.toString('utf8');
@@ -2477,46 +2495,226 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 // top-level router
 // -------------------------------------------------------------------------------------------
 
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      try {
-        const method = req.method ?? 'GET';
-        const { pathname, search } = urlOf(req);
-        if (method === 'GET' && pathname === '/healthz') { sendJson(res, 200, { ok: true }); return; }
-        if (pathname === '/mcp') { await handleMcp(req, res); return; }
-        if (pathname === '/api/graphql') {
-          if (method !== 'POST') { sendJson(res, 404, { message: 'Not Found' }); return; }
-          await handleGraphql(req, res);
-          return;
-        }
-        if (pathname.startsWith('/api/v3')) { await handleRest(req, res); return; }
-        // git smart HTTP: /<owner>/<repo>.git/...
-        const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.+)$/.exec(pathname);
-        if (gitMatch) {
-          const owner = decodeURIComponent(gitMatch[1]!);
-          const repoName = decodeURIComponent(gitMatch[2]!);
-          const service = gitMatch[3]!;
-          if (method === 'GET' && service === 'info/refs') {
-            await handleInfoRefs(req, res, owner, repoName, search.get('service') ?? '');
-            return;
-          }
-          if (method === 'POST' && service === 'git-upload-pack') {
-            await handleUploadPack(req, res, owner, repoName);
-            return;
-          }
-          if (method === 'POST' && service === 'git-receive-pack') {
-            await handleReceivePack(req, res, owner, repoName);
-            return;
-          }
-          sendJson(res, 404, { message: 'Not Found' });
-          return;
-        }
-        sendJson(res, 404, { message: 'Not Found' });
-      } catch (err) {
-        if (!res.headersSent) sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
-        else res.destroy();
+const REASON: Record<number, string> = {
+  200: 'OK', 201: 'Created', 400: 'Bad Request', 401: 'Unauthorized',
+  404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict',
+  422: 'Unprocessable Entity', 500: 'Internal Server Error',
+};
+
+/** One response, bound to its connection: assembles head + body and hands them over. */
+class TcpRes implements HttpRes {
+  headersSent = false;
+  private status = 200;
+  private headers: Record<string, string> = {};
+  private ended = false;
+  private destroyed = false;
+  private readonly deliver: (head: Buffer, body: Buffer) => void;
+  private readonly destroySocket: () => void;
+  constructor(deliver: (head: Buffer, body: Buffer) => void, destroySocket: () => void) {
+    this.deliver = deliver;
+    this.destroySocket = destroySocket;
+  }
+  writeHead(status: number, headers: Record<string, string>): void {
+    if (this.ended) return;
+    this.status = status;
+    this.headers = headers;
+    this.headersSent = true;
+  }
+  end(body?: string | Buffer): void {
+    if (this.ended || this.destroyed) return;
+    this.ended = true;
+    const payload = body === undefined ? Buffer.alloc(0) : typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
+    const lines = [`HTTP/1.1 ${this.status} ${REASON[this.status] ?? ''}\r\n`];
+    for (const [k, v] of Object.entries(this.headers)) lines.push(`${k}: ${v}\r\n`);
+    if (!('content-length' in this.headers)) lines.push(`content-length: ${payload.length}\r\n`);
+    lines.push('\r\n');
+    this.deliver(Buffer.from(lines.join(''), 'ascii'), payload);
+  }
+  destroy(): void {
+    this.destroyed = true;
+    this.destroySocket();
+  }
+}
+
+interface PendingRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string | undefined>;
+  body: Buffer;
+  closeAfter: boolean;
+}
+
+interface ParsedRequest {
+  req: PendingRequest | null;
+  consumed: number;
+  needMore: boolean;
+  error?: string;
+  expectContinue?: boolean;
+}
+
+function parseRequest(buf: Buffer): ParsedRequest {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd === -1) {
+    if (buf.length > 65536) return { req: null, consumed: 0, needMore: false, error: 'headers too large' };
+    return { req: null, consumed: 0, needMore: true };
+  }
+  const head = buf.subarray(0, headEnd).toString('ascii');
+  const lines = head.split('\r\n');
+  const requestLine = lines[0] ?? '';
+  const m = /^(\S+) (\S+) HTTP\/(\d)\.(\d)$/.exec(requestLine);
+  if (m === null) return { req: null, consumed: 0, needMore: false, error: 'bad request line' };
+  const method = m[1]!;
+  let url = m[2]!;
+  const httpMajor = Number(m[3]);
+  const headers: Record<string, string | undefined> = {};
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i]!;
+    const colon = line.indexOf(':');
+    if (colon === -1) continue;
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    const prev = headers[name];
+    if (prev === undefined) headers[name] = value;
+    else headers[name] = `${prev}, ${value}`;
+  }
+  // Absolute-form URIs (http://host/path) collapse to origin-form.
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    const slash = url.indexOf('/', url.indexOf('://') + 3);
+    url = slash === -1 ? '/' : url.slice(slash);
+  }
+  const connection = typeof headers.connection === 'string' ? headers.connection.toLowerCase() : '';
+  const closeAfter = httpMajor === 0 ? !connection.includes('keep-alive') : connection.includes('close');
+  const expectContinue = typeof headers.expect === 'string' && headers.expect.toLowerCase().includes('100-continue');
+  const bodyStart = headEnd + 4;
+  const te = typeof headers['transfer-encoding'] === 'string' ? headers['transfer-encoding'].toLowerCase() : '';
+  if (te.includes('chunked')) {
+    let pos = bodyStart;
+    const chunks: Buffer[] = [];
+    for (;;) {
+      const eol = buf.indexOf('\r\n', pos);
+      if (eol === -1) return { req: null, consumed: 0, needMore: true, expectContinue };
+      const sizeLine = buf.subarray(pos, eol).toString('ascii').trim();
+      const size = Number.parseInt(sizeLine.split(';')[0]!, 16);
+      if (Number.isNaN(size) || size < 0) return { req: null, consumed: 0, needMore: false, error: 'bad chunk size' };
+      if (size === 0) {
+        const blank = buf.indexOf('\r\n\r\n', eol + 2);
+        if (blank === -1) return { req: null, consumed: 0, needMore: true, expectContinue };
+        return { req: { method, url, headers, body: Buffer.concat(chunks), closeAfter }, consumed: blank + 4, needMore: false };
       }
-    })();
+      if (buf.length < eol + 2 + size + 2) return { req: null, consumed: 0, needMore: true, expectContinue };
+      chunks.push(Buffer.from(buf.subarray(eol + 2, eol + 2 + size)));
+      pos = eol + 2 + size + 2;
+    }
+  }
+  const cl = typeof headers['content-length'] === 'string' ? Number.parseInt(headers['content-length'], 10) : 0;
+  if (Number.isNaN(cl) || cl < 0) return { req: null, consumed: 0, needMore: false, error: 'bad content-length' };
+  if (buf.length < bodyStart + cl) return { req: null, consumed: 0, needMore: true, expectContinue };
+  const body = Buffer.from(buf.subarray(bodyStart, bodyStart + cl));
+  return { req: { method, url, headers, body, closeAfter }, consumed: bodyStart + cl, needMore: false };
+}
+
+/** The old createApp body, now transport-agnostic: route one request to its handler. */
+async function dispatch(req: HttpReq, res: HttpRes): Promise<void> {
+  try {
+    const method = req.method ?? 'GET';
+    const { pathname, search } = urlOf(req);
+    if (method === 'GET' && pathname === '/healthz') { sendJson(res, 200, { ok: true }); return; }
+    if (pathname === '/mcp') { await handleMcp(req, res); return; }
+    if (pathname === '/api/graphql') {
+      if (method !== 'POST') { sendJson(res, 404, { message: 'Not Found' }); return; }
+      await handleGraphql(req, res);
+      return;
+    }
+    if (pathname.startsWith('/api/v3')) { await handleRest(req, res); return; }
+    // git smart HTTP: /<owner>/<repo>.git/...
+    const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.+)$/.exec(pathname);
+    if (gitMatch) {
+      const owner = decodeURIComponent(gitMatch[1]!);
+      const repoName = decodeURIComponent(gitMatch[2]!);
+      const service = gitMatch[3]!;
+      if (method === 'GET' && service === 'info/refs') {
+        await handleInfoRefs(req, res, owner, repoName, search.get('service') ?? '');
+        return;
+      }
+      if (method === 'POST' && service === 'git-upload-pack') {
+        await handleUploadPack(req, res, owner, repoName);
+        return;
+      }
+      if (method === 'POST' && service === 'git-receive-pack') {
+        await handleReceivePack(req, res, owner, repoName);
+        return;
+      }
+      sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+    sendJson(res, 404, { message: 'Not Found' });
+  } catch (err) {
+    if (!res.headersSent) sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+    else res.destroy();
+  }
+}
+
+/** One client connection: accumulate bytes, dispatch one request at a time (in order). */
+class TcpConnection {
+  private buf = Buffer.alloc(0);
+  private busy = false;
+  private closed = false;
+  private continueSent = false;
+  private readonly socket: Socket;
+  constructor(socket: Socket) {
+    this.socket = socket;
+    socket.on('data', (chunk: Buffer) => this.onData(chunk));
+    socket.on('error', () => this.destroy());
+    socket.on('close', () => { this.closed = true; });
+  }
+  private destroy(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.socket.destroy();
+  }
+  private onData(chunk: Buffer): void {
+    if (this.closed) return;
+    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
+    this.pump();
+  }
+  private pump(): void {
+    if (this.busy || this.closed) return;
+    const parsed = parseRequest(this.buf);
+    if (parsed.error !== undefined) {
+      this.socket.write('HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n');
+      this.destroy();
+      return;
+    }
+    if (parsed.req === null) {
+      if (parsed.expectContinue === true && !this.continueSent) {
+        this.continueSent = true;
+        this.socket.write('HTTP/1.1 100 Continue\r\n\r\n');
+      }
+      return;
+    }
+    const req = parsed.req;
+    this.buf = this.buf.subarray(parsed.consumed);
+    this.busy = true;
+    this.continueSent = false;
+    const res = new TcpRes(
+      (head, body) => {
+        if (this.closed) return;
+        const out = head.length + body.length === 0 ? head : Buffer.concat([head, body]);
+        this.socket.write(out, () => {
+          this.busy = false;
+          if (req.closeAfter) this.destroy();
+          else this.pump();
+        });
+      },
+      () => this.destroy(),
+    );
+    void dispatch(req, res);
+  }
+}
+
+export function createApp(): TcpServer {
+  return createTcpServer((socket: Socket) => {
+    socket.setNoDelay(true);
+    void new TcpConnection(socket);
   });
 }
